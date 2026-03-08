@@ -42,6 +42,8 @@ export async function loadConfig(state: ConfigState) {
   }
   state.configLoading = true;
   state.lastError = null;
+  // Reset dirty flag to ensure configForm is updated from snapshot on reload
+  state.configFormDirty = false;
   try {
     const res = await state.client.request<ConfigSnapshot>("config.get", {});
     applyConfigSnapshot(state, res);
