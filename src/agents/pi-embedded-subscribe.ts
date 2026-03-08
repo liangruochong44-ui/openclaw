@@ -641,13 +641,23 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
 
   const sessionUnsubscribe = params.session.subscribe(createEmbeddedPiSessionEventHandler(ctx));
 
+  // Track if we've successfully called sessionUnsubscribe to prevent duplicate calls
+  // and ensure proper cleanup even under error/timeout conditions.
+  let sessionUnsubscribed = false;
+
   const unsubscribe = () => {
-    if (state.unsubscribed) {
+    // Always attempt to call sessionUnsubscribe if we haven't already,
+    // regardless of the unsubscribed state. This ensures cleanup happens even if
+    // multiple error/timeout paths trigger unsubscribe.
+    if (sessionUnsubscribed) {
       return;
     }
-    // Mark as unsubscribed FIRST to prevent waitForCompactionRetry from creating
+    sessionUnsubscribed = true;
+
+    // Mark as unsubscribed to prevent waitForCompactionRetry from creating
     // new un-resolvable promises during teardown.
     state.unsubscribed = true;
+
     // Reject pending compaction wait to unblock awaiting code.
     // Don't resolve, as that would incorrectly signal "compaction complete" when it's still in-flight.
     if (state.compactionRetryPromise) {
