@@ -1,4 +1,5 @@
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import { dispatchChannelMessageAction } from "../../channels/plugins/message-actions.js";
 import type { ChannelId, ChannelThreadingToolContext } from "../../channels/plugins/types.js";
 import type { OpenClawConfig } from "../../config/config.js";
@@ -57,7 +58,7 @@ async function tryHandleWithPluginAction(params: {
   }
   const mediaLocalRoots = getAgentScopedMediaLocalRoots(
     params.ctx.cfg,
-    params.ctx.agentId ?? params.ctx.mirror?.agentId,
+    params.ctx.agentId ?? params.ctx.mirror?.agentId ?? resolveDefaultAgentId(params.ctx.cfg),
   );
   const handled = await dispatchChannelMessageAction({
     channel: params.ctx.channel,

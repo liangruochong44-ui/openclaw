@@ -1,3 +1,4 @@
+import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import {
   chunkByParagraph,
   chunkMarkdownTextWithMode,
@@ -532,7 +533,7 @@ async function deliverOutboundPayloadsCore(
   const sendSignal = params.deps?.sendSignal ?? sendMessageSignal;
   const mediaLocalRoots = getAgentScopedMediaLocalRoots(
     cfg,
-    params.session?.agentId ?? params.mirror?.agentId,
+    params.session?.agentId ?? params.mirror?.agentId ?? resolveDefaultAgentId(cfg),
   );
   const results: OutboundDeliveryResult[] = [];
   const handler = await createChannelHandler({

@@ -94,6 +94,9 @@ async function assertLocalMediaAllowed(
     resolved = path.resolve(mediaPath);
   }
 
+  // Also keep the original path for symlink workspace support
+  const originalPath = path.resolve(mediaPath);
+
   // Hardening: the default allowlist includes the OpenClaw temp dir, and tests/CI may
   // override the state dir into tmp. Avoid accidentally allowing per-agent
   // `workspace-*` state roots via the temp-root prefix match; require explicit
@@ -127,7 +130,17 @@ async function assertLocalMediaAllowed(
         `Invalid localRoots entry (refuses filesystem root): ${root}. Pass a narrower directory.`,
       );
     }
-    if (resolved === resolvedRoot || resolved.startsWith(resolvedRoot + path.sep)) {
+
+    // Check both resolved paths and original paths to handle symlink workspaces
+    // Case 1: resolved media path under resolved root
+    // Case 2: original media path under original root (for symlinked workspaces)
+    const originalRoot = path.resolve(root);
+    const isResolvedMatch =
+      resolved === resolvedRoot || resolved.startsWith(resolvedRoot + path.sep);
+    const isOriginalMatch =
+      originalPath === originalRoot || originalPath.startsWith(originalRoot + path.sep);
+
+    if (isResolvedMatch || isOriginalMatch) {
       return;
     }
   }

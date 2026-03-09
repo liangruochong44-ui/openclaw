@@ -12,6 +12,7 @@ import { CANVAS_WS_PATH, handleA2uiHttpRequest } from "../canvas-host/a2ui.js";
 import type { CanvasHostHandler } from "../canvas-host/server.js";
 import { loadConfig } from "../config/config.js";
 import type { createSubsystemLogger } from "../logging/subsystem.js";
+import { generateTraceId, runWithTrace } from "../logging/trace.js";
 import { safeEqualSecret } from "../security/secret-equal.js";
 import { handleSlackHttpRequest } from "../slack/http/index.js";
 import {
@@ -610,176 +611,184 @@ export function createGatewayHttpServer(opts: {
       });
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse) {
-    setDefaultSecurityHeaders(res, {
-      strictTransportSecurity: strictTransportSecurityHeader,
-    });
+    // Generate trace ID for request correlation
+    const traceId = generateTraceId();
 
-    // Don't interfere with WebSocket upgrades; ws handles the 'upgrade' event.
-    if (String(req.headers.upgrade ?? "").toLowerCase() === "websocket") {
-      return;
-    }
+    return runWithTrace(traceId, async () => {
+      setDefaultSecurityHeaders(res, {
+        strictTransportSecurity: strictTransportSecurityHeader,
+      });
 
-    try {
-      const configSnapshot = loadConfig();
-      const trustedProxies = configSnapshot.gateway?.trustedProxies ?? [];
-      const allowRealIpFallback = configSnapshot.gateway?.allowRealIpFallback === true;
-      const scopedCanvas = normalizeCanvasScopedUrl(req.url ?? "/");
-      if (scopedCanvas.malformedScopedPath) {
-        sendGatewayAuthFailure(res, { ok: false, reason: "unauthorized" });
+      // Add trace ID header for request correlation (optional per issue #40353)
+      res.setHeader("X-Trace-ID", traceId);
+
+      // Don't interfere with WebSocket upgrades; ws handles the 'upgrade' event.
+      if (String(req.headers.upgrade ?? "").toLowerCase() === "websocket") {
         return;
       }
-      if (scopedCanvas.rewrittenUrl) {
-        req.url = scopedCanvas.rewrittenUrl;
-      }
-      const requestPath = new URL(req.url ?? "/", "http://localhost").pathname;
-      const mattermostSlashCallbackPaths = resolveMattermostSlashCallbackPaths(configSnapshot);
-      const pluginPathContext = handlePluginRequest
-        ? resolvePluginRoutePathContext(requestPath)
-        : null;
-      const requestStages: GatewayHttpRequestStage[] = [
-        {
-          name: "hooks",
-          run: () => handleHooksRequest(req, res),
-        },
-        {
-          name: "tools-invoke",
-          run: () =>
-            handleToolsInvokeHttpRequest(req, res, {
-              auth: resolvedAuth,
-              trustedProxies,
-              allowRealIpFallback,
-              rateLimiter,
-            }),
-        },
-        {
-          name: "slack",
-          run: () => handleSlackHttpRequest(req, res),
-        },
-      ];
-      if (openResponsesEnabled) {
-        requestStages.push({
-          name: "openresponses",
-          run: () =>
-            handleOpenResponsesHttpRequest(req, res, {
-              auth: resolvedAuth,
-              config: openResponsesConfig,
-              trustedProxies,
-              allowRealIpFallback,
-              rateLimiter,
-            }),
-        });
-      }
-      if (openAiChatCompletionsEnabled) {
-        requestStages.push({
-          name: "openai",
-          run: () =>
-            handleOpenAiHttpRequest(req, res, {
-              auth: resolvedAuth,
-              config: openAiChatCompletionsConfig,
-              trustedProxies,
-              allowRealIpFallback,
-              rateLimiter,
-            }),
-        });
-      }
-      if (canvasHost) {
-        requestStages.push({
-          name: "canvas-auth",
-          run: async () => {
-            if (!isCanvasPath(requestPath)) {
-              return false;
-            }
-            const ok = await authorizeCanvasRequest({
-              req,
-              auth: resolvedAuth,
-              trustedProxies,
-              allowRealIpFallback,
-              clients,
-              canvasCapability: scopedCanvas.capability,
-              malformedScopedPath: scopedCanvas.malformedScopedPath,
-              rateLimiter,
-            });
-            if (!ok.ok) {
-              sendGatewayAuthFailure(res, ok);
-              return true;
-            }
-            return false;
+
+      try {
+        const configSnapshot = loadConfig();
+        const trustedProxies = configSnapshot.gateway?.trustedProxies ?? [];
+        const allowRealIpFallback = configSnapshot.gateway?.allowRealIpFallback === true;
+        const scopedCanvas = normalizeCanvasScopedUrl(req.url ?? "/");
+        if (scopedCanvas.malformedScopedPath) {
+          sendGatewayAuthFailure(res, { ok: false, reason: "unauthorized" });
+          return;
+        }
+        if (scopedCanvas.rewrittenUrl) {
+          req.url = scopedCanvas.rewrittenUrl;
+        }
+        const requestPath = new URL(req.url ?? "/", "http://localhost").pathname;
+        const mattermostSlashCallbackPaths = resolveMattermostSlashCallbackPaths(configSnapshot);
+        const pluginPathContext = handlePluginRequest
+          ? resolvePluginRoutePathContext(requestPath)
+          : null;
+        const requestStages: GatewayHttpRequestStage[] = [
+          {
+            name: "hooks",
+            run: () => handleHooksRequest(req, res),
           },
-        });
-        requestStages.push({
-          name: "a2ui",
-          run: () => handleA2uiHttpRequest(req, res),
-        });
-        requestStages.push({
-          name: "canvas-http",
-          run: () => canvasHost.handleHttpRequest(req, res),
-        });
-      }
-      // Plugin routes run before the Control UI SPA catch-all so explicitly
-      // registered plugin endpoints stay reachable. Core built-in gateway
-      // routes above still keep precedence on overlapping paths.
-      requestStages.push(
-        ...buildPluginRequestStages({
-          req,
-          res,
-          requestPath,
-          mattermostSlashCallbackPaths,
-          pluginPathContext,
-          handlePluginRequest,
-          shouldEnforcePluginGatewayAuth,
-          resolvedAuth,
-          trustedProxies,
-          allowRealIpFallback,
-          rateLimiter,
-        }),
-      );
-
-      if (controlUiEnabled) {
-        requestStages.push({
-          name: "control-ui-avatar",
-          run: () =>
-            handleControlUiAvatarRequest(req, res, {
-              basePath: controlUiBasePath,
-              resolveAvatar: (agentId) => resolveAgentAvatar(configSnapshot, agentId),
-            }),
-        });
-        requestStages.push({
-          name: "control-ui-http",
-          run: () =>
-            handleControlUiHttpRequest(req, res, {
-              basePath: controlUiBasePath,
-              config: configSnapshot,
-              root: controlUiRoot,
-            }),
-        });
-      }
-
-      requestStages.push({
-        name: "gateway-probes",
-        run: () =>
-          handleGatewayProbeRequest(
+          {
+            name: "tools-invoke",
+            run: () =>
+              handleToolsInvokeHttpRequest(req, res, {
+                auth: resolvedAuth,
+                trustedProxies,
+                allowRealIpFallback,
+                rateLimiter,
+              }),
+          },
+          {
+            name: "slack",
+            run: () => handleSlackHttpRequest(req, res),
+          },
+        ];
+        if (openResponsesEnabled) {
+          requestStages.push({
+            name: "openresponses",
+            run: () =>
+              handleOpenResponsesHttpRequest(req, res, {
+                auth: resolvedAuth,
+                config: openResponsesConfig,
+                trustedProxies,
+                allowRealIpFallback,
+                rateLimiter,
+              }),
+          });
+        }
+        if (openAiChatCompletionsEnabled) {
+          requestStages.push({
+            name: "openai",
+            run: () =>
+              handleOpenAiHttpRequest(req, res, {
+                auth: resolvedAuth,
+                config: openAiChatCompletionsConfig,
+                trustedProxies,
+                allowRealIpFallback,
+                rateLimiter,
+              }),
+          });
+        }
+        if (canvasHost) {
+          requestStages.push({
+            name: "canvas-auth",
+            run: async () => {
+              if (!isCanvasPath(requestPath)) {
+                return false;
+              }
+              const ok = await authorizeCanvasRequest({
+                req,
+                auth: resolvedAuth,
+                trustedProxies,
+                allowRealIpFallback,
+                clients,
+                canvasCapability: scopedCanvas.capability,
+                malformedScopedPath: scopedCanvas.malformedScopedPath,
+                rateLimiter,
+              });
+              if (!ok.ok) {
+                sendGatewayAuthFailure(res, ok);
+                return true;
+              }
+              return false;
+            },
+          });
+          requestStages.push({
+            name: "a2ui",
+            run: () => handleA2uiHttpRequest(req, res),
+          });
+          requestStages.push({
+            name: "canvas-http",
+            run: () => canvasHost.handleHttpRequest(req, res),
+          });
+        }
+        // Plugin routes run before the Control UI SPA catch-all so explicitly
+        // registered plugin endpoints stay reachable. Core built-in gateway
+        // routes above still keep precedence on overlapping paths.
+        requestStages.push(
+          ...buildPluginRequestStages({
             req,
             res,
             requestPath,
+            mattermostSlashCallbackPaths,
+            pluginPathContext,
+            handlePluginRequest,
+            shouldEnforcePluginGatewayAuth,
             resolvedAuth,
             trustedProxies,
             allowRealIpFallback,
-            getReadiness,
-          ),
-      });
+            rateLimiter,
+          }),
+        );
 
-      if (await runGatewayHttpRequestStages(requestStages)) {
-        return;
+        if (controlUiEnabled) {
+          requestStages.push({
+            name: "control-ui-avatar",
+            run: () =>
+              handleControlUiAvatarRequest(req, res, {
+                basePath: controlUiBasePath,
+                resolveAvatar: (agentId) => resolveAgentAvatar(configSnapshot, agentId),
+              }),
+          });
+          requestStages.push({
+            name: "control-ui-http",
+            run: () =>
+              handleControlUiHttpRequest(req, res, {
+                basePath: controlUiBasePath,
+                config: configSnapshot,
+                root: controlUiRoot,
+              }),
+          });
+        }
+
+        requestStages.push({
+          name: "gateway-probes",
+          run: () =>
+            handleGatewayProbeRequest(
+              req,
+              res,
+              requestPath,
+              resolvedAuth,
+              trustedProxies,
+              allowRealIpFallback,
+              getReadiness,
+            ),
+        });
+
+        if (await runGatewayHttpRequestStages(requestStages)) {
+          return;
+        }
+
+        res.statusCode = 404;
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        res.end("Not Found");
+      } catch {
+        res.statusCode = 500;
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        res.end("Internal Server Error");
       }
-
-      res.statusCode = 404;
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.end("Not Found");
-    } catch {
-      res.statusCode = 500;
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.end("Internal Server Error");
-    }
+    });
   }
 
   return httpServer;
